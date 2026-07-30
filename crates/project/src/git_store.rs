@@ -7408,7 +7408,9 @@ impl Repository {
         is_dir: bool,
     ) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
-        let repository_dir = self.snapshot.repository_dir_abs_path.clone();
+        // `info/exclude` lives in the common dir, which is shared across a repository's
+        // linked worktrees — not in the per-worktree repository dir.
+        let common_dir = self.snapshot.common_dir_abs_path.clone();
         let path_display = repo_path.as_ref().display(PathStyle::Unix);
         let path = repo_path.as_unix_str().to_owned();
         let file_path_str = if is_dir {
@@ -7425,7 +7427,7 @@ impl Repository {
                     RepositoryState::Local(LocalRepositoryState { fs, .. }) => {
                         append_pattern_to_ignore_file(
                             fs,
-                            repository_dir.join(git::REPO_EXCLUDE),
+                            common_dir.join(git::REPO_EXCLUDE),
                             file_path_str,
                         )
                         .await

@@ -9,7 +9,7 @@ use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use encoding_rs::Encoding;
 use fs::{
     Fs, MTime, PathEvent, PathEventKind, RemoveOptions, TrashId, Watcher, copy_recursive,
-    read_dir_items,
+    io_error_is_absence, read_dir_items,
 };
 use futures::{
     FutureExt as _, Stream, StreamExt,
@@ -2268,6 +2268,15 @@ impl LocalWorktree {
             })
             .collect()
     }
+
+    /// Whether the cached `info/exclude` for `work_dir_abs_path` still needs a re-read.
+    #[cfg(feature = "test-support")]
+    pub fn repo_exclude_needs_update(&self, work_dir_abs_path: &Path) -> Option<bool> {
+        self.snapshot
+            .repo_exclude_by_work_dir_abs_path
+            .get(work_dir_abs_path)
+            .map(|(_, needs_update)| *needs_update)
+    }
 }
 
 impl RemoteWorktree {
@@ -3650,12 +3659,37 @@ impl BackgroundScannerState {
             .get(&work_directory_id)
             .map_or(0, |existing_repository| existing_repository.git_dir_scan_id);
 
+        let work_directory_abs_path: Arc<Path> = work_directory_abs_path.as_path().into();
+        // Registration owns exclude state: load a present info/exclude now so
+        // ignore updates that run after insert (affected_repo_roots) see it.
+        // Always insert an entry so a later info/exclude create can mark it
+        // dirty. Present, confirmed-absent, and unparsable are clean;
+        // indeterminate I/O inserts empty but stays dirty so the reload path
+        // retries instead of treating a transient failure as known-gone.
+        let exclude_abs_path = common_dir_abs_path.join(REPO_EXCLUDE);
+        let (exclude, needs_update) =
+            match load_gitignore_existing(&exclude_abs_path, &work_directory_abs_path, fs).await {
+                GitignoreLoad::Present(ignore) => (Arc::new(ignore), false),
+                GitignoreLoad::Absent => (Arc::new(Gitignore::empty()), false),
+                GitignoreLoad::Unparsable(error) => {
+                    Err::<(), _>(error).log_err();
+                    (Arc::new(Gitignore::empty()), false)
+                }
+                GitignoreLoad::Indeterminate(error) => {
+                    Err::<(), _>(error).log_err();
+                    (Arc::new(Gitignore::empty()), true)
+                }
+            };
+        self.snapshot
+            .repo_exclude_by_work_dir_abs_path
+            .insert(work_directory_abs_path.clone(), (exclude, needs_update));
+
         self.snapshot.git_repositories.insert(
             work_directory_id,
             LocalRepositoryEntry {
                 work_directory_id,
                 work_directory,
-                work_directory_abs_path: work_directory_abs_path.as_path().into(),
+                work_directory_abs_path,
                 git_dir_scan_id,
                 dot_git_abs_path,
                 common_dir_abs_path,
@@ -3778,6 +3812,50 @@ async fn build_gitignore_with_root(abs_path: &Path, root: &Path, fs: &dyn Fs) ->
         .load(abs_path)
         .await
         .with_context(|| format!("failed to load gitignore file at {}", abs_path.display()))?;
+    parse_gitignore_contents(abs_path, root, &contents)
+}
+
+/// Outcome of loading an exclude/gitignore file that may be absent or bad.
+///
+/// Classified at the error-production site so callers never need to downcast
+/// `anyhow` chains. Unparsable content fails identically forever (clear dirty);
+/// transient I/O is Indeterminate (leave dirty and retry).
+enum GitignoreLoad {
+    Present(Gitignore),
+    Absent,
+    Unparsable(anyhow::Error),
+    Indeterminate(anyhow::Error),
+}
+
+/// Loads a gitignore file, distinguishing present / confirmed-absent /
+/// unparsable content / indeterminate I/O.
+async fn load_gitignore_existing(abs_path: &Path, root: &Path, fs: &dyn Fs) -> GitignoreLoad {
+    let bytes = match fs.load_bytes(abs_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if io_error_is_absence(&error) => return GitignoreLoad::Absent,
+        Err(error) => {
+            return GitignoreLoad::Indeterminate(error.context(format!(
+                "failed to load gitignore file at {}",
+                abs_path.display()
+            )));
+        }
+    };
+    let contents = match String::from_utf8(bytes) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return GitignoreLoad::Unparsable(anyhow::Error::new(error).context(format!(
+                "gitignore file at {} is not valid UTF-8",
+                abs_path.display()
+            )));
+        }
+    };
+    match parse_gitignore_contents(abs_path, root, &contents) {
+        Ok(gitignore) => GitignoreLoad::Present(gitignore),
+        Err(error) => GitignoreLoad::Unparsable(error),
+    }
+}
+
+fn parse_gitignore_contents(abs_path: &Path, root: &Path, contents: &str) -> Result<Gitignore> {
     let mut builder = GitignoreBuilder::new(root);
     for line in contents.lines() {
         builder.add_line(Some(abs_path.into()), line)?;
@@ -4975,12 +5053,13 @@ impl BackgroundScanner {
                     }
                 }
 
-                if self.track_git_repositories
-                    && abs_path
-                        .as_path()
-                        .ends_with(Path::new(DOT_GIT).join(REPO_EXCLUDE))
-                {
-                    if let Some(repository) = snapshot.git_repositories.values().find(|repo| {
+                // Route `info/exclude` changes by the resolved common dir, not by a
+                // literal `.git/info/exclude` suffix, so a linked worktree or bare repo
+                // whose common dir is named `foo.git`/`.bare` still refreshes its cache.
+                // A main checkout and linked worktree can share one common dir while
+                // keeping separate cache entries keyed by work dir — dirty every match.
+                if self.track_git_repositories && abs_path.as_path().ends_with(REPO_EXCLUDE) {
+                    for repository in snapshot.git_repositories.values().filter(|repo| {
                         repo.common_dir_abs_path.join(REPO_EXCLUDE) == abs_path.as_path()
                     }) {
                         work_dirs_needing_exclude_update
@@ -5418,6 +5497,16 @@ impl BackgroundScanner {
             if self.track_git_repositories {
                 if child_name == DOT_GIT {
                     let mut state = self.state.lock().await;
+                    // On the initial scan a nested repo is not yet in
+                    // `repo_exclude_by_work_dir_abs_path` when the job's stack
+                    // was built (child jobs inherit the parent's stack), so
+                    // siblings would miss info/exclude. Append after a *new*
+                    // registration only — rescans already have the exclude on
+                    // the stack from `ignore_stack_for_abs_path` (cache hit).
+                    let exclude_already_loaded = state
+                        .snapshot
+                        .repo_exclude_by_work_dir_abs_path
+                        .contains_key(&job.abs_path);
                     state
                         .insert_git_repository(
                             child_path.clone(),
@@ -5425,6 +5514,15 @@ impl BackgroundScanner {
                             self.watcher.as_ref(),
                         )
                         .await;
+                    if !exclude_already_loaded
+                        && let Some((exclude, _)) = state
+                            .snapshot
+                            .repo_exclude_by_work_dir_abs_path
+                            .get(&job.abs_path)
+                    {
+                        ignore_stack =
+                            ignore_stack.append(IgnoreKind::RepoExclude, exclude.clone());
+                    }
                 } else if child_name == GITIGNORE {
                     match build_gitignore(&child_abs_path, self.fs.as_ref()).await {
                         Ok(ignore) => {
@@ -5884,6 +5982,9 @@ impl BackgroundScanner {
         let mut excludes_to_load: Vec<(Arc<Path>, PathBuf)> = Vec::new();
 
         // First pass: collect updates and drop stale entries without awaiting.
+        // Do not clear exclude dirty flags here — only after Present, Absent, or
+        // Unparsable. Indeterminate I/O must leave dirty set so the next scan
+        // retries instead of stranding a never-loaded exclude.
         {
             let snapshot = &mut self.state.lock().await.snapshot;
             let abs_path = snapshot.abs_path.clone();
@@ -5897,18 +5998,9 @@ impl BackgroundScanner {
                     .iter()
                     .find(|(_, repo)| &repo.work_directory_abs_path == work_dir_abs_path);
 
-                if *needs_update {
-                    *needs_update = false;
-                    if work_dir_abs_path.starts_with(abs_path.as_path()) {
-                        ignores_to_update.push(work_dir_abs_path.clone());
-                    } else {
-                        ignores_to_update.push(abs_path.as_path().into());
-                    }
-
-                    if let Some((_, repository)) = repository {
-                        let exclude_abs_path = repository.common_dir_abs_path.join(REPO_EXCLUDE);
-                        excludes_to_load.push((work_dir_abs_path.clone(), exclude_abs_path));
-                    }
+                if *needs_update && let Some((_, repository)) = repository {
+                    let exclude_abs_path = repository.common_dir_abs_path.join(REPO_EXCLUDE);
+                    excludes_to_load.push((work_dir_abs_path.clone(), exclude_abs_path));
                 }
 
                 if repository.is_none() {
@@ -5944,27 +6036,62 @@ impl BackgroundScanner {
                 });
         }
 
-        // Load gitignores asynchronously (outside the lock)
+        // Load excludes asynchronously (outside the lock).
+        // Present/Absent: install matcher, clear dirty, schedule ignore recompute.
+        // Unparsable: keep last-good matcher, clear dirty (no re-read loop), no
+        // recompute — installed rules did not change.
+        // Indeterminate: leave dirty for retry.
         let mut loaded_excludes: Vec<(Arc<Path>, Arc<Gitignore>)> = Vec::new();
+        let mut unparsable_excludes: Vec<Arc<Path>> = Vec::new();
         for (work_dir_abs_path, exclude_abs_path) in excludes_to_load {
-            if let Ok(current_exclude) =
-                build_gitignore_with_root(&exclude_abs_path, &work_dir_abs_path, self.fs.as_ref())
-                    .await
+            match load_gitignore_existing(&exclude_abs_path, &work_dir_abs_path, self.fs.as_ref())
+                .await
             {
-                loaded_excludes.push((work_dir_abs_path, Arc::new(current_exclude)));
+                GitignoreLoad::Present(current_exclude) => {
+                    loaded_excludes.push((work_dir_abs_path, Arc::new(current_exclude)));
+                }
+                GitignoreLoad::Absent => {
+                    loaded_excludes.push((work_dir_abs_path, Arc::new(Gitignore::empty())));
+                }
+                GitignoreLoad::Unparsable(error) => {
+                    Err::<(), _>(error).log_err();
+                    unparsable_excludes.push(work_dir_abs_path);
+                }
+                GitignoreLoad::Indeterminate(error) => {
+                    Err::<(), _>(error).log_err();
+                }
             }
         }
 
-        // Second pass: apply updates.
+        // Second pass: install definitive loads and clear dirty.
         if !loaded_excludes.is_empty() {
             let snapshot = &mut self.state.lock().await.snapshot;
+            let abs_path = snapshot.abs_path.clone();
 
             for (work_dir_abs_path, exclude) in loaded_excludes {
-                if let Some((existing_exclude, _)) = snapshot
+                if let Some((existing_exclude, needs_update)) = snapshot
                     .repo_exclude_by_work_dir_abs_path
                     .get_mut(&work_dir_abs_path)
                 {
                     *existing_exclude = exclude;
+                    *needs_update = false;
+                    if work_dir_abs_path.starts_with(abs_path.as_path()) {
+                        ignores_to_update.push(work_dir_abs_path);
+                    } else {
+                        ignores_to_update.push(abs_path.as_path().into());
+                    }
+                }
+            }
+        }
+
+        if !unparsable_excludes.is_empty() {
+            let snapshot = &mut self.state.lock().await.snapshot;
+            for work_dir_abs_path in unparsable_excludes {
+                if let Some((_, needs_update)) = snapshot
+                    .repo_exclude_by_work_dir_abs_path
+                    .get_mut(&work_dir_abs_path)
+                {
+                    *needs_update = false;
                 }
             }
         }
@@ -6212,6 +6339,14 @@ impl BackgroundScanner {
                         entry.common_dir_abs_path = new_common_dir;
                         entry.git_dir_scan_id = scan_id;
                     });
+                    // Retarget changes which common dir's info/exclude applies; dirty so
+                    // B's rules reload instead of retaining A's.
+                    state
+                        .snapshot
+                        .repo_exclude_by_work_dir_abs_path
+                        .entry(work_directory_abs_path.clone())
+                        .or_insert_with(|| (Arc::new(Gitignore::empty()), true))
+                        .1 = true;
                     affected_repo_roots.push(work_directory_abs_path);
                 }
                 Ok(Some(_)) => {}

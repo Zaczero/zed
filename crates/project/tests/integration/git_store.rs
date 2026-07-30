@@ -1828,6 +1828,94 @@ mod gitfile_retarget {
     }
 }
 
+mod info_exclude {
+    use fs::{FakeFs, Fs};
+    use git::repository::Worktree as GitWorktree;
+    use gpui::TestAppContext;
+    use project::Project;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::path::{Path, PathBuf};
+    use util::{path, rel_path::rel_path};
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    /// `info/exclude` lives in the common dir shared by all of a repository's
+    /// worktrees. Writing it into the per-worktree admin dir (the repository dir of a
+    /// linked worktree) would leave the exclusion invisible to git and to the other
+    /// worktrees.
+    #[gpui::test]
+    async fn test_add_path_to_git_info_exclude_writes_to_common_dir(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/repo_a"),
+            json!({
+                ".git": {},
+                "file.txt": "a",
+            }),
+        )
+        .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new(path!("/repo_a/.git")),
+            false,
+            GitWorktree {
+                path: PathBuf::from(path!("/linked")),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "aaa111".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        fs.write(path!("/linked/secret.env").as_ref(), b"x=1")
+            .await
+            .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/linked").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .next()
+                .expect("linked worktree should register a repository")
+                .clone()
+        });
+        let receiver = repository.update(cx, |repository, _| {
+            repository.add_path_to_git_info_exclude(
+                &git::repository::RepoPath::from_rel_path(rel_path("secret.env")),
+                false,
+            )
+        });
+        cx.executor().run_until_parked();
+        receiver.await.unwrap().unwrap();
+
+        let common_exclude = fs
+            .load(path!("/repo_a/.git/info/exclude").as_ref())
+            .await
+            .expect("exclude must be written into the shared common dir");
+        assert!(
+            common_exclude.contains("secret.env"),
+            "pattern missing from common-dir info/exclude: {common_exclude:?}"
+        );
+        assert!(
+            fs.load(path!("/repo_a/.git/worktrees/feature/info/exclude").as_ref())
+                .await
+                .is_err(),
+            "per-worktree admin dir must not receive info/exclude writes"
+        );
+    }
+}
+
 mod resolve_worktree_tests {
     use fs::FakeFs;
     use gpui::TestAppContext;

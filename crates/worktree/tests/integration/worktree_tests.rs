@@ -3989,6 +3989,356 @@ async fn test_repo_exclude(executor: BackgroundExecutor, cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_info_exclude_unparsable_preserves_last_good_and_clears_dirty(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // A deterministically unparsable info/exclude must not leave the cache dirty
+    // forever (infinite re-read loop) and must keep last-good rules so one bad
+    // line does not suddenly expose previously excluded files.
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    let project_dir = Path::new(path!("/project"));
+    fs.insert_tree(
+        project_dir,
+        json!({
+            ".git": {
+                "info": {
+                    "exclude": "secret.env\n"
+                }
+            },
+            "secret.env": "x=1",
+            "tracked.txt": "ok",
+        }),
+    )
+    .await;
+
+    let worktree = Worktree::local(
+        project_dir,
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["secret.env"],
+                tracked_paths: &["tracked.txt"],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            worktree
+                .as_local()
+                .unwrap()
+                .repo_exclude_needs_update(project_dir),
+            Some(false),
+            "valid exclude should be clean after registration"
+        );
+    });
+
+    // `[z-a]` is rejected by globset (reversed character range). Unclosed `[` is
+    // accepted as a literal by the ignore crate's `allow_unclosed_class`.
+    fs.write(&project_dir.join(DOT_GIT).join(REPO_EXCLUDE), b"[z-a]\n")
+        .await
+        .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["secret.env"],
+                tracked_paths: &["tracked.txt"],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            worktree
+                .as_local()
+                .unwrap()
+                .repo_exclude_needs_update(project_dir),
+            Some(false),
+            "unparsable exclude must clear dirty so later batches do not re-read forever"
+        );
+    });
+
+    // A later scan with no exclude content change must not re-dirty or drop rules.
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["secret.env"],
+                tracked_paths: &["tracked.txt"],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            worktree
+                .as_local()
+                .unwrap()
+                .repo_exclude_needs_update(project_dir),
+            Some(false),
+        );
+    });
+}
+
+#[gpui::test]
+
+async fn test_nested_repo_info_exclude_on_initial_scan(cx: &mut TestAppContext) {
+    // Nested repos register during the initial scan after their scan job's
+    // ignore stack was already built (cache miss). info/exclude must still
+    // apply to siblings on that first scan without any FS event rescue.
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "outer.txt": "ok",
+        "nested": {
+            ".git": {},
+            "hidden.secret": "secret",
+            "visible.txt": "visible",
+        },
+    }));
+
+    std::fs::write(
+        dir.path().join("nested").join(DOT_GIT).join(REPO_EXCLUDE),
+        "*.secret\n",
+    )
+    .expect("write nested info/exclude before worktree open");
+
+    let worktree = Worktree::local(
+        dir.path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    // Initial scan only — no flush_fs_events so the event path cannot rescue.
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    worktree.read_with(cx, |tree, _| {
+        let secret = tree
+            .entry_for_path(rel_path("nested/hidden.secret"))
+            .expect("hidden.secret should be indexed");
+        let visible = tree
+            .entry_for_path(rel_path("nested/visible.txt"))
+            .expect("visible.txt should be indexed");
+        assert!(
+            secret.is_ignored,
+            "nested info/exclude must apply on initial scan, got entry: {secret:?}"
+        );
+        assert!(
+            !visible.is_ignored,
+            "sibling not matching exclude must stay unignored, got entry: {visible:?}"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_info_exclude_loaded_when_repository_becomes_valid(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // Registration owns exclude state: a nested `.git` that becomes valid after
+    // open (objects created last) must still pick up a pre-existing info/exclude.
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {},
+            "nested": {
+                "secret.env": "x=1",
+                "tracked.txt": "ok",
+            },
+        }),
+    )
+    .await;
+
+    // Incomplete nested .git: valid HEAD + refs + info/exclude, but no objects yet.
+    fs.create_dir(Path::new(path!("/root/nested/.git")))
+        .await
+        .unwrap();
+    fs.write(
+        Path::new(path!("/root/nested/.git/HEAD")),
+        b"ref: refs/heads/main\n",
+    )
+    .await
+    .unwrap();
+    fs.create_dir(Path::new(path!("/root/nested/.git/refs")))
+        .await
+        .unwrap();
+    fs.create_dir(Path::new(path!("/root/nested/.git/info")))
+        .await
+        .unwrap();
+    fs.write(
+        Path::new(path!("/root/nested/.git/info/exclude")),
+        b"*.env\n",
+    )
+    .await
+    .unwrap();
+
+    let worktree = Worktree::local(
+        path!("/root").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.read_with(cx, |worktree, _| {
+        let repos = worktree.as_local().unwrap().repositories();
+        assert!(
+            !repos
+                .iter()
+                .any(|path| path.as_ref() == Path::new(path!("/root/nested"))),
+            "nested without objects must not be registered yet"
+        );
+    });
+
+    fs.create_dir(Path::new(path!("/root/nested/.git/objects")))
+        .await
+        .unwrap();
+    worktree.flush_fs_events(cx).await;
+
+    worktree.update(cx, |worktree, _cx| {
+        assert!(
+            worktree
+                .as_local()
+                .unwrap()
+                .repositories()
+                .iter()
+                .any(|path| path.as_ref() == Path::new(path!("/root/nested"))),
+            "nested must register once objects appears"
+        );
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["nested/secret.env"],
+                tracked_paths: &["nested/tracked.txt"],
+                ..Default::default()
+            },
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_info_exclude_cleared_when_file_deleted(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // Deleting info/exclude must stop its rules; confirmed absence installs empty.
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    let project_dir = Path::new(path!("/project"));
+    fs.insert_tree(
+        project_dir,
+        json!({
+            ".git": {
+                "info": {
+                    "exclude": "stale.txt"
+                }
+            },
+            "stale.txt": "was excluded",
+            "keep.txt": "tracked",
+        }),
+    )
+    .await;
+
+    let worktree = Worktree::local(
+        project_dir,
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["stale.txt"],
+                tracked_paths: &["keep.txt"],
+                ..Default::default()
+            },
+        );
+    });
+
+    fs.remove_file(
+        &project_dir.join(DOT_GIT).join(REPO_EXCLUDE),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    worktree.flush_fs_events(cx).await;
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                tracked_paths: &["stale.txt", "keep.txt"],
+                ..Default::default()
+            },
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_repo_exclude_anchored_pattern(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -4686,20 +5036,40 @@ async fn test_objects_dir_transition_registers_and_unregisters_repository(
     });
 }
 /// Repositories A and B, linked checkout of A at `/linked`, B's admin dir, and a
-/// scanned worktree.
+/// scanned worktree. Parameterized by what actually differs across retarget tests.
 async fn setup_linked_worktree_retarget(
     executor: BackgroundExecutor,
     cx: &mut TestAppContext,
+    source_exclude: Option<&str>,
+    target_exclude: Option<&str>,
     linked_files: &[(&str, &str)],
 ) -> (Arc<FakeFs>, Entity<Worktree>, PathBuf) {
     use git::repository::Worktree as GitWorktree;
 
     let fs = FakeFs::new(executor);
 
-    fs.insert_tree(path!("/repo_a"), json!({ ".git": {}, "file.txt": "a" }))
-        .await;
-    fs.insert_tree(path!("/repo_b"), json!({ ".git": {}, "file.txt": "b" }))
-        .await;
+    let repo_a = match source_exclude {
+        Some(exclude) => json!({
+            ".git": { "info": { "exclude": exclude } },
+            "file.txt": "a",
+        }),
+        None => json!({
+            ".git": {},
+            "file.txt": "a",
+        }),
+    };
+    let repo_b = match target_exclude {
+        Some(exclude) => json!({
+            ".git": { "info": { "exclude": exclude } },
+            "file.txt": "b",
+        }),
+        None => json!({
+            ".git": {},
+            "file.txt": "b",
+        }),
+    };
+    fs.insert_tree(path!("/repo_a"), repo_a).await;
+    fs.insert_tree(path!("/repo_b"), repo_b).await;
 
     fs.add_linked_worktree_for_repo(
         Path::new(path!("/repo_a/.git")),
@@ -4760,7 +5130,7 @@ async fn test_gitfile_retarget_updates_repository_paths(
     // the work-directory entry remains registered.
     init_test(cx);
     let (fs, tree, admin_b) =
-        setup_linked_worktree_retarget(executor, cx, &[("file.txt", "content")]).await;
+        setup_linked_worktree_retarget(executor, cx, None, None, &[("file.txt", "content")]).await;
 
     let identities_before = tree.read_with(cx, |tree, _| {
         tree.as_local().unwrap().repository_identities()
@@ -4811,6 +5181,110 @@ async fn test_gitfile_retarget_updates_repository_paths(
         "repository_dir should now be B's admin dir"
     );
 }
+#[gpui::test]
+async fn test_info_exclude_follows_gitfile_retarget(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // After gitfile retarget A→B, B's info/exclude must apply and A's must not.
+    init_test(cx);
+    let (fs, worktree, admin_b) = setup_linked_worktree_retarget(
+        executor,
+        cx,
+        Some("from-a.txt"),
+        Some("from-b.txt"),
+        &[("from-a.txt", "a"), ("from-b.txt", "b"), ("other.txt", "o")],
+    )
+    .await;
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["from-a.txt"],
+                tracked_paths: &["from-b.txt", "other.txt"],
+                ..Default::default()
+            },
+        );
+    });
+
+    fs.pause_events();
+    fs.remove_file(path!("/linked/.git").as_ref(), Default::default())
+        .await
+        .unwrap();
+    fs.write(
+        path!("/linked/.git").as_ref(),
+        format!("gitdir: {}\n", admin_b.display()).as_bytes(),
+    )
+    .await
+    .unwrap();
+    fs.unpause_events_and_flush();
+    worktree.flush_fs_events(cx).await;
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["from-b.txt"],
+                tracked_paths: &["from-a.txt", "other.txt"],
+                ..Default::default()
+            },
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_info_exclude_cleared_on_retarget_to_repo_without_exclude(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // Retarget A→B where B has no info/exclude must install empty rules, not
+    // keep A's exclude permanently (confirmed absence vs I/O error).
+    init_test(cx);
+    let (fs, worktree, admin_b) = setup_linked_worktree_retarget(
+        executor,
+        cx,
+        Some("from-a.txt"),
+        None,
+        &[("from-a.txt", "a"), ("other.txt", "o")],
+    )
+    .await;
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                ignored_paths: &["from-a.txt"],
+                tracked_paths: &["other.txt"],
+                ..Default::default()
+            },
+        );
+    });
+
+    fs.pause_events();
+    fs.remove_file(path!("/linked/.git").as_ref(), Default::default())
+        .await
+        .unwrap();
+    fs.write(
+        path!("/linked/.git").as_ref(),
+        format!("gitdir: {}\n", admin_b.display()).as_bytes(),
+    )
+    .await
+    .unwrap();
+    fs.unpause_events_and_flush();
+    worktree.flush_fs_events(cx).await;
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            WorktreeExpectations {
+                tracked_paths: &["from-a.txt", "other.txt"],
+                ..Default::default()
+            },
+        );
+    });
+}
+
 #[cfg(unix)]
 #[gpui::test]
 async fn test_resolve_io_error_preserves_repository_registration(cx: &mut TestAppContext) {
@@ -4898,7 +5372,8 @@ async fn test_shared_common_dir_event_updates_all_repositories(
     // A main checkout and one of its linked worktrees can both live inside the
     // same project worktree, sharing a common git directory. An event in that
     // common directory (e.g. a ref update) must refresh every repository that
-    // reads from it, not just the first match.
+    // reads from it, not just the first match. The shared info/exclude must
+    // also dirty both exclude caches so both work dirs observe new rules.
     init_test(cx);
 
     use git::repository::Worktree as GitWorktree;
@@ -4910,6 +5385,8 @@ async fn test_shared_common_dir_event_updates_all_repositories(
             "main_repo": {
                 ".git": {},
                 "file.txt": "content",
+                "shared-ignored.txt": "ignored",
+                "visible.txt": "visible",
             },
         }),
     )
@@ -4926,6 +5403,15 @@ async fn test_shared_common_dir_event_updates_all_repositories(
         },
     )
     .await;
+    fs.write(
+        path!("/project/linked/shared-ignored.txt").as_ref(),
+        b"ignored",
+    )
+    .await
+    .unwrap();
+    fs.write(path!("/project/linked/visible.txt").as_ref(), b"visible")
+        .await
+        .unwrap();
 
     let tree = Worktree::local(
         path!("/project").as_ref(),
@@ -4968,6 +5454,64 @@ async fn test_shared_common_dir_event_updates_all_repositories(
         ],
         "a ref update in the shared common dir should refresh both repositories"
     );
+
+    // Shared info/exclude: both registered work dirs have separate cache entries
+    // keyed by their own work directory. A write under the shared common dir
+    // must dirty every matching entry, not only the first .find match.
+    fs.create_dir(path!("/project/main_repo/.git/info").as_ref())
+        .await
+        .unwrap();
+    fs.write(
+        path!("/project/main_repo/.git/info/exclude").as_ref(),
+        b"shared-ignored.txt\n",
+    )
+    .await
+    .unwrap();
+    tree.flush_fs_events(cx).await;
+
+    tree.update(cx, |tree, _cx| {
+        check_worktree_entries(
+            tree,
+            WorktreeExpectations {
+                ignored_paths: &["main_repo/shared-ignored.txt", "linked/shared-ignored.txt"],
+                tracked_paths: &["main_repo/visible.txt", "linked/visible.txt"],
+                ..Default::default()
+            },
+        );
+    });
+
+    fs.write(
+        path!("/project/main_repo/.git/info/exclude").as_ref(),
+        b"newly-ignored.txt\n",
+    )
+    .await
+    .unwrap();
+    fs.write(
+        path!("/project/main_repo/newly-ignored.txt").as_ref(),
+        b"new",
+    )
+    .await
+    .unwrap();
+    fs.write(path!("/project/linked/newly-ignored.txt").as_ref(), b"new")
+        .await
+        .unwrap();
+    tree.flush_fs_events(cx).await;
+
+    tree.update(cx, |tree, _cx| {
+        check_worktree_entries(
+            tree,
+            WorktreeExpectations {
+                ignored_paths: &["main_repo/newly-ignored.txt", "linked/newly-ignored.txt"],
+                tracked_paths: &[
+                    "main_repo/shared-ignored.txt",
+                    "linked/shared-ignored.txt",
+                    "main_repo/visible.txt",
+                    "linked/visible.txt",
+                ],
+                ..Default::default()
+            },
+        );
+    });
 }
 
 #[gpui::test]
