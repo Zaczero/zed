@@ -1982,6 +1982,11 @@ mod resolve_worktree_tests {
         fs.insert_tree(
             "/monty/.bare",
             json!({
+                // A real bare repo has its own HEAD and object/ref stores in the
+                // common dir; resolution now validates the repository.
+                "HEAD": "ref: refs/heads/main",
+                "objects": {},
+                "refs": {},
                 "worktrees": {
                     "feature-a": {
                         "commondir": "../../",

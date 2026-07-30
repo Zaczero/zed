@@ -5255,6 +5255,9 @@ mod tests {
         fs.insert_tree(
             "/foo/.bare",
             json!({
+                "HEAD": "ref: refs/heads/main",
+                "objects": {},
+                "refs": {},
                 "worktrees": {
                     "my-feature": {
                         "commondir": "../../",
@@ -5296,14 +5299,17 @@ mod tests {
 
         // Superproject `/Foo` with a submodule `Bar`. A submodule's `.git` is a
         // file pointing into the superproject's `.git/modules/<name>` directory,
-        // structurally like a linked worktree's `.git` file.
+        // structurally like a linked worktree's `.git` file. A submodule's git
+        // dir is a full repository: valid HEAD plus its own object/ref stores.
         fs.insert_tree(
             "/Foo",
             json!({
                 ".git": {
                     "modules": {
                         "Bar": {
-                            "HEAD": "ref: refs/heads/main"
+                            "HEAD": "ref: refs/heads/main",
+                            "objects": {},
+                            "refs": {}
                         }
                     }
                 },
@@ -5331,17 +5337,15 @@ mod tests {
         assert_eq!(result.identity_paths.paths(), &[PathBuf::from("/Foo/Bar")]);
     }
 
-    #[gpui::test]
-    async fn test_recent_workspace_identity_deduplicates_main_and_linked_worktree(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let fs = fs::FakeFs::new(cx.executor());
-
+    async fn insert_linked_worktree_project(fs: &fs::FakeFs) {
         fs.insert_tree(
             "/the-project",
             json!({
                 ".git": "gitdir: ./.bare\n",
                 ".bare": {
+                    "HEAD": "ref: refs/heads/main",
+                    "objects": {},
+                    "refs": {},
                     "worktrees": {
                         "feature-a": {
                             "commondir": "../../",
@@ -5353,7 +5357,6 @@ mod tests {
             }),
         )
         .await;
-
         fs.insert_tree(
             "/the-project/feature-a",
             json!({
@@ -5362,6 +5365,14 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    #[gpui::test]
+    async fn test_recent_workspace_identity_deduplicates_main_and_linked_worktree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        insert_linked_worktree_project(&fs).await;
 
         let t0 = Utc::now() - chrono::Duration::hours(1);
         let t1 = Utc::now();
@@ -5399,31 +5410,7 @@ mod tests {
         let db =
             WorkspaceDb::open_test_db("test_recent_project_workspaces_preserve_reopen_paths").await;
 
-        fs.insert_tree(
-            "/the-project",
-            json!({
-                ".git": "gitdir: ./.bare\n",
-                ".bare": {
-                    "worktrees": {
-                        "feature-a": {
-                            "commondir": "../../",
-                            "HEAD": "ref: refs/heads/feature-a"
-                        }
-                    }
-                },
-                "src": { "main.rs": "" }
-            }),
-        )
-        .await;
-
-        fs.insert_tree(
-            "/the-project/feature-a",
-            json!({
-                ".git": "gitdir: ../.bare/worktrees/feature-a\n",
-                "src": { "lib.rs": "" }
-            }),
-        )
-        .await;
+        insert_linked_worktree_project(&fs).await;
 
         db.save_workspace(workspace_with(
             1,
@@ -5498,6 +5485,9 @@ mod tests {
             json!({
                 ".git": "gitdir: ./.bare\n",
                 ".bare": {
+                    "HEAD": "ref: refs/heads/main",
+                    "objects": {},
+                    "refs": {},
                     "worktrees": {
                         "feature-a": {
                             "commondir": "../../",
@@ -5576,6 +5566,9 @@ mod tests {
             json!({
                 ".git": "gitdir: ./.bare\n",
                 ".bare": {
+                    "HEAD": "ref: refs/heads/main",
+                    "objects": {},
+                    "refs": {},
                     "worktrees": {
                         "feature-a": {
                             "commondir": "../../",

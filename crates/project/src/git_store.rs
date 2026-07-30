@@ -9573,34 +9573,21 @@ fn format_job_key(key: &GitJobKey) -> SharedString {
 /// repository root. Returns `None` if `path` is a normal repository, not a git
 /// repo, or if resolution fails.
 ///
-/// Resolution works by:
-/// 1. Reading the `.git` file to get the `gitdir:` pointer
-/// 2. Following that to the worktree-specific git directory
-/// 3. Reading the `commondir` file to find the shared `.git` directory
-/// 4. Deriving the main repo's identity path from the common dir
+/// Resolution goes through the shared [`fs::resolve_git_repository`], so it agrees
+/// with worktree discovery and only treats *validated* repositories as worktrees; a
+/// linked worktree is distinguished by its repository dir differing from the shared
+/// common dir, from which the main repo's identity path is derived.
 pub async fn resolve_git_worktree_to_main_repo(fs: &dyn Fs, path: &Path) -> Option<PathBuf> {
-    let dot_git = path.join(".git");
-    let metadata = fs.metadata(&dot_git).await.ok()??;
-    if metadata.is_dir {
-        return None; // Normal repo, not a linked worktree
-    }
-    // It's a .git file — parse the gitdir: pointer
-    let content = fs.load(&dot_git).await.ok()?;
-    let gitdir_rel = content.strip_prefix("gitdir:")?.trim();
-    let gitdir_abs = fs.canonicalize(&path.join(gitdir_rel)).await.ok()?;
+    let (repository_dir, common_dir) = fs::resolve_git_repository(&path.join(git::DOT_GIT), fs)
+        .await
+        .ok()??;
     // Submodules also use a `.git` file, but they are independent projects whose
     // identity is their own working directory (`path`), not the superproject's
     // `.git/modules/<name>` git dir. Leave them unresolved.
-    if is_submodule_git_dir(&gitdir_abs) {
+    if is_submodule_git_dir(&repository_dir) {
         return None;
     }
-    // Read commondir to find the main .git directory
-    let commondir_content = fs.load(&gitdir_abs.join("commondir")).await.ok()?;
-    let common_dir = fs
-        .canonicalize(&gitdir_abs.join(commondir_content.trim()))
-        .await
-        .ok()?;
-    Some(repo_identity_path(&common_dir).to_path_buf())
+    (repository_dir != common_dir).then(|| repo_identity_path(&common_dir).to_path_buf())
 }
 
 /// Validates that the resolved worktree directory is acceptable:
