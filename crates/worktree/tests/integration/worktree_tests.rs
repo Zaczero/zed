@@ -4,7 +4,9 @@ use anyhow::Result;
 use encoding_rs;
 use fs::{FakeFs, Fs, PathEventKind, RealFs, RemoveOptions};
 use git::{DOT_GIT, GITIGNORE, REPO_EXCLUDE};
-use gpui::{AppContext as _, BackgroundExecutor, BorrowAppContext, Context, Task, TestAppContext};
+use gpui::{
+    AppContext as _, BackgroundExecutor, BorrowAppContext, Context, Entity, Task, TestAppContext,
+};
 use parking_lot::Mutex;
 use postage::stream::Stream;
 use pretty_assertions::assert_eq;
@@ -1693,17 +1695,15 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
     let path = PathBuf::from("/root/one/node_modules/c/lib");
 
     // No work happens when files and directories change within an unloaded directory.
+    // Git-metadata classification of the resulting event is purely in-memory (matched
+    // against registered repositories), so it makes no per-ancestor fs.metadata calls.
     let prev_fs_call_count = fs.read_dir_call_count() + fs.metadata_call_count();
-    // When we open a directory, we check each ancestor whether it's a git
-    // repository. That means we have an fs.metadata call per ancestor that we
-    // need to subtract here.
-    let ancestors = path.ancestors().count();
 
     fs.create_dir(path.as_ref()).await.unwrap();
     cx.executor().run_until_parked();
 
     assert_eq!(
-        fs.read_dir_call_count() + fs.metadata_call_count() - prev_fs_call_count - ancestors,
+        fs.read_dir_call_count() + fs.metadata_call_count() - prev_fs_call_count,
         0
     );
 }
@@ -4517,19 +4517,15 @@ async fn test_invisible_worktree_does_not_track_ancestor_git_repository(
 }
 
 #[gpui::test]
-async fn test_linked_worktree_gitfile_event_preserves_repo(
+async fn test_linked_worktree_invalid_gitfile_unregisters_repo(
     executor: BackgroundExecutor,
     cx: &mut TestAppContext,
 ) {
-    // Regression test: in a linked worktree, `.git` is a file (containing
-    // "gitdir: ..."), not a directory. When the background scanner receives
-    // a filesystem event for a path inside the main repo's `.git` directory
-    // (which it watches via the commondir), the ancestor-walking code in
-    // `process_events` calls `is_git_dir` on each ancestor. If `is_git_dir`
-    // treats `.git` files the same as `.git` directories, it incorrectly
-    // identifies the gitfile as a git dir, adds it to `dot_git_abs_paths`,
-    // and `update_git_repositories` panics because the path is outside the
-    // worktree root.
+    // A linked worktree's `.git` is a gitfile (`gitdir: ...`). When that gitfile is
+    // overwritten with garbage, the repository is no longer resolvable, so event
+    // revalidation must unregister it — and never panic (a corrupt gitfile once
+    // tripped the ancestor-walking classifier). Restoring a valid gitfile re-registers
+    // the repository.
     init_test(cx);
     use git::repository::Worktree as GitWorktree;
 
@@ -4567,21 +4563,331 @@ async fn test_linked_worktree_gitfile_event_preserves_repo(
         .await;
     cx.run_until_parked();
 
-    // Overwrite the .git gitfile with garbage to trigger an event for the
-    // gitfile path itself, which only matches `dot_git_abs_path`.
-    fs.write(path!("/linked_worktree/.git").as_ref(), b"garbage")
+    let original_gitfile = fs
+        .load(path!("/linked_worktree/.git").as_ref())
         .await
         .unwrap();
-    tree.flush_fs_events(cx).await;
-
-    // The worktree should still be intact.
     tree.read_with(cx, |tree, _| {
         assert_eq!(
             tree.snapshot().root_repo_common_dir().map(|p| p.as_ref()),
             Some(Path::new(path!("/main_repo/.git"))),
-            "linked worktree repo should survive a gitfile change event"
+            "linked worktree repo should be registered after the initial scan"
         );
     });
+
+    fs.write(path!("/linked_worktree/.git").as_ref(), b"garbage")
+        .await
+        .unwrap();
+    tree.flush_fs_events(cx).await;
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.snapshot().root_repo_common_dir(),
+            None,
+            "an unresolvable gitfile should unregister the repository"
+        );
+    });
+
+    fs.write(
+        path!("/linked_worktree/.git").as_ref(),
+        original_gitfile.as_bytes(),
+    )
+    .await
+    .unwrap();
+    tree.flush_fs_events(cx).await;
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.snapshot().root_repo_common_dir().map(|p| p.as_ref()),
+            Some(Path::new(path!("/main_repo/.git"))),
+            "a restored gitfile should re-register the linked worktree repository"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_objects_dir_transition_registers_and_unregisters_repository(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // The exact `.git/objects` path is a repository-validity input and must reach
+    // revalidation: creating it registers a previously incomplete `.git`, and deleting
+    // it unregisters a live one. Loose-object descendants remain suppressed for perf.
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    // Do not use `insert_tree({".git": {}})`: that attaches in-memory git state and
+    // would treat the repo as valid without literal store directories.
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "file.txt": "content",
+        }),
+    )
+    .await;
+    fs.create_dir(Path::new(path!("/root/.git"))).await.unwrap();
+    fs.write(
+        Path::new(path!("/root/.git/HEAD")),
+        b"ref: refs/heads/main\n",
+    )
+    .await
+    .unwrap();
+    fs.create_dir(Path::new(path!("/root/.git/refs")))
+        .await
+        .unwrap();
+
+    let tree = Worktree::local(
+        path!("/root").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    tree.update(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    cx.run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.as_local().unwrap().repositories().is_empty(),
+            "HEAD+refs without objects is not a repository"
+        );
+    });
+
+    fs.create_dir(Path::new(path!("/root/.git/objects")))
+        .await
+        .unwrap();
+    tree.flush_fs_events(cx).await;
+    tree.read_with(cx, |tree, _| {
+        pretty_assertions::assert_eq!(
+            tree.as_local().unwrap().repositories(),
+            [Path::new(path!("/root")).into()],
+            "creating the bare objects directory should register the repository"
+        );
+    });
+
+    fs.remove_dir(
+        Path::new(path!("/root/.git/objects")),
+        RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    tree.flush_fs_events(cx).await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.as_local().unwrap().repositories().is_empty(),
+            "deleting the bare objects directory should unregister the repository"
+        );
+    });
+}
+/// Repositories A and B, linked checkout of A at `/linked`, B's admin dir, and a
+/// scanned worktree.
+async fn setup_linked_worktree_retarget(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+    linked_files: &[(&str, &str)],
+) -> (Arc<FakeFs>, Entity<Worktree>, PathBuf) {
+    use git::repository::Worktree as GitWorktree;
+
+    let fs = FakeFs::new(executor);
+
+    fs.insert_tree(path!("/repo_a"), json!({ ".git": {}, "file.txt": "a" }))
+        .await;
+    fs.insert_tree(path!("/repo_b"), json!({ ".git": {}, "file.txt": "b" }))
+        .await;
+
+    fs.add_linked_worktree_for_repo(
+        Path::new(path!("/repo_a/.git")),
+        false,
+        GitWorktree {
+            path: PathBuf::from(path!("/linked")),
+            ref_name: Some("refs/heads/feature".into()),
+            sha: "abc123".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    for (name, content) in linked_files {
+        let file_path = Path::new(path!("/linked")).join(name);
+        fs.write(&file_path, content.as_bytes()).await.unwrap();
+    }
+
+    let admin_b = PathBuf::from(path!("/repo_b/.git/worktrees/feature"));
+    fs.create_dir(&admin_b).await.unwrap();
+    fs.write(&admin_b.join("HEAD"), b"ref: refs/heads/feature\n")
+        .await
+        .unwrap();
+    fs.write(&admin_b.join("commondir"), path!("/repo_b/.git").as_bytes())
+        .await
+        .unwrap();
+    fs.write(&admin_b.join("gitdir"), path!("/linked/.git").as_bytes())
+        .await
+        .unwrap();
+
+    let worktree = Worktree::local(
+        path!("/linked").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    (fs, worktree, admin_b)
+}
+#[gpui::test]
+async fn test_gitfile_retarget_updates_repository_paths(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // Path-retarget coverage: rewriting a linked worktree's gitfile from admin A
+    // to admin B (same work-dir path) updates repository_dir/common_dir to B while
+    // the work-directory entry remains registered.
+    init_test(cx);
+    let (fs, tree, admin_b) =
+        setup_linked_worktree_retarget(executor, cx, &[("file.txt", "content")]).await;
+
+    let identities_before = tree.read_with(cx, |tree, _| {
+        tree.as_local().unwrap().repository_identities()
+    });
+    assert_eq!(
+        identities_before.len(),
+        1,
+        "linked worktree should be registered"
+    );
+    let (repository_dir_before, common_dir_before) = identities_before.into_iter().next().unwrap();
+    assert_eq!(
+        common_dir_before.as_ref(),
+        Path::new(path!("/repo_a/.git")),
+        "initially pointed at repository A"
+    );
+    assert!(
+        repository_dir_before
+            .as_ref()
+            .starts_with(path!("/repo_a/.git")),
+        "admin dir should be under A: {repository_dir_before:?}"
+    );
+
+    fs.write(
+        path!("/linked/.git").as_ref(),
+        format!("gitdir: {}\n", admin_b.display()).as_bytes(),
+    )
+    .await
+    .unwrap();
+    tree.flush_fs_events(cx).await;
+
+    let identities_after = tree.read_with(cx, |tree, _| {
+        tree.as_local().unwrap().repository_identities()
+    });
+    assert_eq!(
+        identities_after.len(),
+        1,
+        "retarget must keep a single registration"
+    );
+    let (repository_dir_after, common_dir_after) = identities_after.into_iter().next().unwrap();
+    assert_eq!(
+        common_dir_after.as_ref(),
+        Path::new(path!("/repo_b/.git")),
+        "common_dir should now point at repository B"
+    );
+    assert_eq!(
+        repository_dir_after.as_ref(),
+        admin_b.as_path(),
+        "repository_dir should now be B's admin dir"
+    );
+}
+#[cfg(unix)]
+#[gpui::test]
+async fn test_resolve_io_error_preserves_repository_registration(cx: &mut TestAppContext) {
+    // A non-absence I/O failure during revalidation must preserve the existing
+    // registration, not treat the repository as gone.
+    use std::os::unix::fs::PermissionsExt;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        ".git": {},
+        "file.txt": "content",
+    }));
+    let head_path = dir.path().join(".git/HEAD");
+
+    let tree = Worktree::local(
+        dir.path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree.flush_fs_events(cx).await;
+
+    let identities_before = tree.read_with(cx, |tree, _| {
+        tree.as_local().unwrap().repository_identities()
+    });
+    assert_eq!(
+        identities_before.len(),
+        1,
+        "valid git repo should be registered after scan"
+    );
+
+    // Permission failure on HEAD is a non-absence I/O error during resolve.
+    let original_mode = std::fs::metadata(&head_path).unwrap().permissions();
+    std::fs::set_permissions(&head_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Root bypasses permission checks, so chmod 0o000 would not induce an I/O
+    // error and the test would pass for the wrong reason (Ok(Some) keep). Fail
+    // hard when the denial is ineffective rather than skip silently — these
+    // suites have no idiomatic dynamic-skip, and a false green is worse.
+    let head_read = std::fs::File::open(&head_path);
+    if head_read.is_ok() {
+        std::fs::set_permissions(&head_path, original_mode)
+            .expect("restore HEAD permissions before root-bypass panic");
+        panic!(
+            "chmod 0o000 on HEAD did not deny reads (running as root?); \
+             cannot prove Err-preserves-registration without a real I/O failure"
+        );
+    }
+
+    // Trigger revalidation via a non-skipped git metadata event.
+    std::fs::write(
+        dir.path().join(".git/refs/heads/main"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    )
+    .unwrap();
+    tree.flush_fs_events(cx).await;
+
+    let identities_after = tree.read_with(cx, |tree, _| {
+        tree.as_local().unwrap().repository_identities()
+    });
+    assert_eq!(
+        identities_after.len(),
+        1,
+        "permission error must preserve the registration"
+    );
+
+    // Restore so TempTree cleanup can remove the tree.
+    std::fs::set_permissions(&head_path, original_mode).unwrap();
 }
 
 #[gpui::test]

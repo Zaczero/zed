@@ -2252,9 +2252,26 @@ impl GitStore {
                         .entry(repo_id)
                         .or_insert_with(HashSet::new)
                         .insert(worktree_id);
-                    let path_changed = update.old_work_directory_abs_path.as_ref()
-                        != update.new_work_directory_abs_path.as_ref();
-                    if path_changed
+                    // Reinitialize the backend when the repository's identity changes —
+                    // not only its work-directory path but also its resolved `.git`,
+                    // repository, or common dir. The latter happens when a gitfile is
+                    // retargeted to a different repository while the checkout stays put;
+                    // without this the backend would keep pointing at the old repository.
+                    let identity_changed = {
+                        let snapshot = &existing.read(cx).snapshot;
+                        let changed = |new: &Option<Arc<Path>>, current: &Arc<Path>| {
+                            new.as_ref().is_some_and(|new| new != current)
+                        };
+                        update.old_work_directory_abs_path.as_ref()
+                            != update.new_work_directory_abs_path.as_ref()
+                            || changed(
+                                &update.repository_dir_abs_path,
+                                &snapshot.repository_dir_abs_path,
+                            )
+                            || changed(&update.common_dir_abs_path, &snapshot.common_dir_abs_path)
+                            || changed(&update.dot_git_abs_path, &snapshot.dot_git_abs_path)
+                    };
+                    if identity_changed
                         && let Some(dot_git_abs_path) = update.dot_git_abs_path.clone()
                         && let Some(repository_dir_abs_path) =
                             update.repository_dir_abs_path.clone()
